@@ -49,12 +49,26 @@
 #include <libindi/indiproperty.h>
 
 
+struct FrameInfo
+{
+    bool valid = false;
+    int frame_x;
+    int frame_y;
+    int frame_width;
+    int frame_height;
+    int binning_x;
+    int binning_y;
+    int m_bitsPerPixel;
+};
+
 class CapturedFrame
 {
 public:
     void * data;
     size_t size;
     char format[MAXINDIBLOBFMT];
+
+    FrameInfo info;
 
     CapturedFrame() {
         data = nullptr;
@@ -78,6 +92,10 @@ public:
 
         bp->blob = nullptr;
         bp->size = 0;
+    }
+
+    void setInfo(const FrameInfo & info) {
+        this->info = info;
     }
 };
 
@@ -149,8 +167,12 @@ private:
     void     CameraDialog();
     void     CameraSetup();
     bool     ReadFITS(CapturedFrame * cf, usImage& img, bool takeSubframe, const wxRect& subframe);
+    bool     ReadBin(CapturedFrame * cf, usImage& img, bool takeSubframe, const wxRect& subframe);
+    bool     ReadFrame(CapturedFrame * cf, usImage& img, bool takeSubframe, const wxRect& subframe);
     bool     StackStream(CapturedFrame * cf);
     void     SendBinning();
+
+    FrameInfo getCurrentCaptureInfo();
 
     // Update the last frame, discarding any missed frame
     void updateLastFrame(IBLOB * bp);
@@ -265,6 +287,56 @@ CapturedFrame * CameraINDI::waitFrame(unsigned long waitTime)
     return nullptr;
 }
 
+FrameInfo CameraINDI::getCurrentCaptureInfo() {
+    FrameInfo ret;
+
+    ret.valid = true;
+
+    if (ccdinfo_prop) {
+        ret.m_bitsPerPixel = IUFindNumber(ccdinfo_prop, "CCD_BITSPERPIXEL")->value;
+    } else {
+        ret.valid = false;
+    }
+
+    if (frame_x) {
+        ret.frame_x = frame_x->value;
+    } else {
+        ret.valid = false;
+    }
+
+    if (frame_y) {
+        ret.frame_y = frame_y->value;
+    } else {
+        ret.valid = false;
+    }
+
+    if (frame_width) {
+        ret.frame_width = frame_width->value;
+    } else {
+        ret.valid = false;
+    }
+
+    if (frame_height) {
+        ret.frame_height = frame_height->value;
+    } else {
+        ret.valid = false;
+    }
+
+    if (binning_x) {
+        ret.binning_x = binning_x->value;
+    } else {
+        ret.valid = false;
+    }
+
+    if (binning_y) {
+        ret.binning_y = binning_y->value;
+    } else {
+        ret.valid = false;
+    }
+
+    return ret;
+}
+
 void CameraINDI::updateLastFrame(IBLOB * blob)
 {
     bool notify = false;
@@ -277,6 +349,7 @@ void CameraINDI::updateLastFrame(IBLOB * blob)
         if (blob) {
             lastFrame = new CapturedFrame();
             lastFrame->steal(blob);
+            lastFrame->setInfo(getCurrentCaptureInfo());
             notify = true;
         }
     }
@@ -457,6 +530,7 @@ void CameraINDI::newBLOB(IBLOB *bp)
         {
             CapturedFrame cf;
             cf.steal(bp);
+            cf.setInfo(getCurrentCaptureInfo());
             StackStream(&cf);
         }
     }
@@ -827,6 +901,143 @@ void CameraINDI::SetCCDdevice()
     }
 }
 
+bool CameraINDI::ReadFrame(CapturedFrame * frame, usImage& img, bool takeSubframe, const wxRect& subframe)
+{
+    if (strcmp(frame->format, ".fits") == 0) {
+        Debug.Write(wxString::Format("INDI Camera Processing fits file\n"));
+        return ReadFITS(frame, img, takeSubframe, subframe);
+    }
+    if (strcmp(frame->format, ".bin") == 0) {
+        Debug.Write(wxString::Format("INDI Camera Processing bin file\n"));
+        return ReadBin(frame, img, takeSubframe, subframe);
+    }
+
+    pFrame->Alert(wxString::Format(_("Unknown image format: %s"), wxString::FromAscii(frame->format)));
+    return false;
+}
+
+
+static void copyPixelsUint8(unsigned short * target, CapturedFrame * source, int sourceOffset, int len)
+{
+    uint8_t * sourcePtr = (uint8_t*)source->data;
+    sourcePtr += sourceOffset;
+    while(len > 0) {
+        *target = *sourcePtr;
+        sourcePtr++;
+        target++;
+        len--;
+    }
+}
+
+static void copyPixelsUint16(unsigned short * target, CapturedFrame * source, int sourceOffset, int len)
+{
+    uint16_t * sourcePtr = (uint16_t*)source->data;
+    memcpy(target, sourcePtr, 2 * len);
+}
+
+static void copyPixelsUint32(unsigned short * target, CapturedFrame * source, int sourceOffset, int len)
+{
+    uint32_t * sourcePtr = (uint32_t*)source->data;
+    sourcePtr += sourceOffset;
+    while(len > 0) {
+        *target = (*sourcePtr) >> 16;
+        sourcePtr++;
+        target++;
+        len--;
+    }
+}
+
+static inline void copyPixels(int bytePerPixels, unsigned short * target, CapturedFrame * source, int sourceOffset, int len)
+{
+    switch(bytePerPixels) {
+    case 1:
+        copyPixelsUint8(target, source, sourceOffset, len);
+        break;
+    case 2:
+        copyPixelsUint16(target, source, sourceOffset, len);
+        break;
+    case 4:
+        copyPixelsUint32(target, source, sourceOffset, len);
+        break;
+    }
+}
+
+
+bool CameraINDI::ReadBin(CapturedFrame * frame, usImage& img, bool takeSubframe, const wxRect& subframe)
+{
+    if (!frame->info.valid) {
+        pFrame->Alert(_("Missing information for native format decoding"));
+        return false;
+    }
+
+    // Assume naxis == 2 for now (not always true, some driver provide RGB !)
+    int xsize = frame->info.frame_width / frame->info.binning_x;
+    int ysize = frame->info.frame_height / frame->info.binning_y;
+
+    int bytePerPixel;
+    if (frame->info.m_bitsPerPixel <= 8) {
+        // Assume uint8_t
+        bytePerPixel = 1;
+    } else if (frame->info.m_bitsPerPixel <= 16) {
+        // FIXME: endianness is not available https://github.com/indilib/indi/issues/1678
+        // Assume uint16_t
+        bytePerPixel = 2;
+    } else if (frame->info.m_bitsPerPixel <= 32) {
+        // FIXME: endianness is not available https://github.com/indilib/indi/issues/1678
+        // Assume uint32_t
+        bytePerPixel = 4;
+    } else {
+        pFrame->Alert(_("Unsupported bpp for native format decoding"));
+        return false;
+    }
+
+    if (frame->size != xsize * ysize * bytePerPixel) {
+        pFrame->Alert(_("Invalid frame size for native format decoding"));
+        return false;
+    }
+
+    if (takeSubframe)
+    {
+        if (FullSize == UNDEFINED_FRAME_SIZE)
+        {
+            // should never happen since we arranged not to take a subframe
+            // unless full frame size is known
+            Debug.Write("internal error: taking subframe before full frame\n");
+            return true;
+        }
+        if (img.Init(FullSize))
+        {
+            pFrame->Alert(_("Memory allocation error"));
+            return true;
+        }
+
+        img.Clear();
+        img.Subframe = subframe;
+        int i = 0;
+        for (int y = 0; y < subframe.height; y++)
+        {
+            unsigned short *dataptr = img.ImageData + (y + subframe.y) * img.Size.GetWidth() + subframe.x;
+            copyPixels(bytePerPixel, dataptr, frame, i, subframe.width);
+            i += subframe.width;
+        }
+    }
+    else
+    {
+        FullSize.Set(xsize, ysize);
+
+        if (img.Init(FullSize))
+        {
+            pFrame->Alert(_("Memory allocation error"));
+            return true;
+        }
+
+        // Read image
+        copyPixels(bytePerPixel, img.ImageData, frame, 0, xsize * ysize);
+    }
+
+    return false;
+}
+
 bool CameraINDI::ReadFITS(CapturedFrame * frame, usImage& img, bool takeSubframe, const wxRect& subframe)
 {
     fitsfile *fptr;  // FITS file pointer
@@ -1110,31 +1321,21 @@ bool CameraINDI::Capture(int duration, usImage& img, int options, const wxRect& 
         first_frame = false;
 
         // exposure complete, process the file
-        if (strcmp(frame->format, ".fits") == 0)
+
+        if (!ReadFrame(frame, img, takeSubframe, subframe))
         {
-            if (INDIConfig::Verbose())
-                Debug.Write(wxString::Format("INDI Camera Processing fits file\n"));
-
-            // for CCD camera
-            if (!ReadFITS(frame, img, takeSubframe, subframe))
-            {
-                delete(frame);
-                if (options & CAPTURE_SUBTRACT_DARK)
-                    SubtractDark(img);
-                if (HasBayer && Binning == 1 && (options & CAPTURE_RECON))
-                    QuickLRecon(img);
-                if (options & CAPTURE_RECON)
-                {
-                    if (PixSizeX != PixSizeY)
-                        SquarePixels(img, PixSizeX, PixSizeY);
-                }
-                return false;
-            }
             delete(frame);
-            return true;
+            if (options & CAPTURE_SUBTRACT_DARK)
+                SubtractDark(img);
+            if (HasBayer && Binning == 1 && (options & CAPTURE_RECON))
+                QuickLRecon(img);
+            if (options & CAPTURE_RECON)
+            {
+                if (PixSizeX != PixSizeY)
+                    SquarePixels(img, PixSizeX, PixSizeY);
+            }
+            return false;
         }
-
-        pFrame->Alert(wxString::Format(_("Unknown image format: %s"), wxString::FromAscii(frame->format)));
         delete(frame);
         return true;
     }
