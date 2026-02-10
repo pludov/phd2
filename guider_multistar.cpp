@@ -41,6 +41,7 @@
  */
 
 #include "phd.h"
+#include "event_server.h"
 
 #include <wx/dir.h>
 #include <algorithm>
@@ -709,8 +710,23 @@ static void AppendStarUse(wxString& secondaryInfo, int starNum, double dX, doubl
     secondaryInfo += wxString::Format("[#%d %0.2f,%0.2f,%0.2f,%s] ", starNum, dX, dY, weight, flag);
 }
 
+void GuiderMultiStar::reportSecondaryStarsAsUnused(MultiStarReport * multiStarReport)
+{
+    if (!m_multiStarMode) {
+        return;
+    }
+    auto pGS = m_guideStars.begin();
+    if (pGS == m_guideStars.end()) {
+        return;
+    }
+    for(pGS++; pGS != m_guideStars.end(); ++pGS)
+    {
+        multiStarReport->addStar(MultiStarReport::Item::unused(*pGS));
+    }
+}
+
 // Use secondary stars to refine Offset value if appropriate.  Return of true means offset has been adjusted
-bool GuiderMultiStar::RefineOffset(const usImage *pImage, GuiderOffset *pOffset)
+bool GuiderMultiStar::RefineOffset(const usImage *pImage, GuiderOffset *pOffset, MultiStarReport * multiStarReport)
 {
     double primaryDistance;
     double secondaryDistance;
@@ -762,11 +778,15 @@ bool GuiderMultiStar::RefineOffset(const usImage *pImage, GuiderOffset *pOffset)
                                 {
                                     pGS->referencePoint.X = pGS->X;
                                     pGS->referencePoint.Y = pGS->Y;
+                                    
+                                    multiStarReport->addStar(MultiStarReport::Item::healthy(*pGS));
                                     ++pGS;
                                 }
                                 else
                                 {
                                     Debug.Write(wxString::Format("MultiStar: #%d removed after lock position change\n", Iter_Inx(pGS)));
+                                    multiStarReport->addStar(MultiStarReport::Item::unhealthy(*pGS, MultiStarReport::Item::Lost));
+
                                     pGS = m_guideStars.erase(pGS);
                                 }
                             }
@@ -784,13 +804,20 @@ bool GuiderMultiStar::RefineOffset(const usImage *pImage, GuiderOffset *pOffset)
             else
                 m_stabilizing = true;                       // get some data for primary star movement
 
+            multiStarReport->setStabilizing(m_stabilizing);
+
             if (!m_stabilizing && m_guideStars.size() > 1 && (sumX != 0 || sumY != 0))
             {
                 wxString secondaryInfo = "MultiStar: ";
                 for (auto pGS = m_guideStars.begin() + 1; pGS != m_guideStars.end();)
                 {
-                    if (m_starsUsed >= m_maxStars || m_guideStars.size() == 1)
+                    if (m_starsUsed >= m_maxStars || m_guideStars.size() == 1) {
+                        while(pGS != m_guideStars.end()) {
+                            multiStarReport->addStar(MultiStarReport::Item::unused(*pGS));
+                            ++pGS;
+                        }
                         break;
+                    }
                     m_starsUsed++;              // "used" means "considered" for purposes of UI
                     if (pGS->Find(pImage, m_searchRegion, pGS->X, pGS->Y, pFrame->GetStarFindMode(),
                         GetMinStarHFD(), pCamera->GetSaturationADU(), Star::FIND_LOGGING_MINIMAL))
@@ -811,6 +838,7 @@ bool GuiderMultiStar::RefineOffset(const usImage *pImage, GuiderOffset *pOffset)
 
                             if (pGS->zeroCount == 5)
                             {
+                                multiStarReport->addStar(MultiStarReport::Item::unhealthy(*pGS, MultiStarReport::Item::ZeroDelta));
                                 AppendStarUse(secondaryInfo, Iter_Inx(pGS), 0, 0, 0, "DZ");
                                 pGS = m_guideStars.erase(pGS);
                                 erasures = true;
@@ -823,15 +851,22 @@ bool GuiderMultiStar::RefineOffset(const usImage *pImage, GuiderOffset *pOffset)
                             {
                                 if (++pGS->missCount > 10)
                                 {
+                                    multiStarReport->addStar(MultiStarReport::Item::unhealthy(*pGS, MultiStarReport::Item::Reset));
+
                                     // Reset the reference point to wherever it is now
                                     pGS->referencePoint.X = pGS->X;
                                     pGS->referencePoint.Y = pGS->Y;
                                     pGS->missCount = 0;
                                     AppendStarUse(secondaryInfo, Iter_Inx(pGS), dX, dY, 0, "R");
                                 }
-                                else
-                                    AppendStarUse(secondaryInfo, Iter_Inx(pGS), dX, dY, 0, "M" + std::to_string(pGS->missCount));
+                                else {
+                                    multiStarReport->addStar(MultiStarReport::Item::unhealthy(*pGS, MultiStarReport::Item::Missed(pGS->missCount)));
+                                    AppendStarUse(secondaryInfo, Iter_Inx(pGS), dX, dY, 0,
+                                                  "M" + std::to_string(pGS->missCount));
+                                }
+
                                 ++pGS;
+
                                 continue;
                             }
                             else if (pGS->missCount > 0)
@@ -847,10 +882,12 @@ bool GuiderMultiStar::RefineOffset(const usImage *pImage, GuiderOffset *pOffset)
                             averaged = true;
                             validStars++;
 
+                            multiStarReport->addStar(MultiStarReport::Item::healthy(*pGS));
                             AppendStarUse(secondaryInfo, Iter_Inx(pGS), dX, dY, wt, "U");
                         }
                         else                                          // exactly zero on both axes, probably a hot pixel, drop it
                         {
+                            multiStarReport->addStar(MultiStarReport::Item::unhealthy(*pGS, MultiStarReport::Item::ZeroDelta));
                             AppendStarUse(secondaryInfo, Iter_Inx(pGS), 0, 0, 0, "DZ");
                             pGS = m_guideStars.erase(pGS);
                             erasures = true;
@@ -859,10 +896,12 @@ bool GuiderMultiStar::RefineOffset(const usImage *pImage, GuiderOffset *pOffset)
                     else
                     {
                         // star not found in its search region
-                        if (++pGS->lostCount < 3)
+                        if (++pGS->lostCount < 3) {
+                            multiStarReport->addStar(MultiStarReport::Item::unhealthy(*pGS, MultiStarReport::Item::Lost));
                             AppendStarUse(secondaryInfo, Iter_Inx(pGS), 0, 0, 0, "NF" + std::to_string(pGS->lostCount));
-                        else
+                        } else
                         {
+                            multiStarReport->addStar(MultiStarReport::Item::unhealthy(*pGS, MultiStarReport::Item::Lost));
                             AppendStarUse(secondaryInfo, Iter_Inx(pGS), 0, 0, 0, "DNF");
                             pGS = m_guideStars.erase(pGS);
                             erasures = true;
@@ -883,13 +922,19 @@ bool GuiderMultiStar::RefineOffset(const usImage *pImage, GuiderOffset *pOffset)
                     {
                         pOffset->cameraOfs.X = sumX;
                         pOffset->cameraOfs.Y = sumY;
+                        multiStarReport->setRefined(true);
+
                         refined = true;
                     }
                     Debug.Write(wxString::Format("%s, %d included, MultiStar: {%0.2f, %0.2f}, one-star: {%0.2f, %0.2f}\n", (refined ? "refined" : "single-star"),
                         validStars, sumX, sumY,
                         origOffset.cameraOfs.X, origOffset.cameraOfs.Y));
                 }
+            } else {
+                reportSecondaryStarsAsUnused(multiStarReport);
             }
+        } else {
+            reportSecondaryStarsAsUnused(multiStarReport);
         }
     }
     catch (const wxString& msg)
@@ -904,11 +949,12 @@ bool GuiderMultiStar::RefineOffset(const usImage *pImage, GuiderOffset *pOffset)
 
 static DistanceChecker s_distanceChecker;
 
-bool GuiderMultiStar::UpdateCurrentPosition(const usImage *pImage, GuiderOffset *ofs, FrameDroppedInfo *errorInfo)
+bool GuiderMultiStar::UpdateCurrentPosition(const usImage *pImage, GuiderOffset *ofs, FrameDroppedInfo *errorInfo, MultiStarReport * multiStarReport)
 {
     if (!m_primaryStar.IsValid() && m_primaryStar.X == 0.0 && m_primaryStar.Y == 0.0)
     {
         Debug.Write("UpdateCurrentPosition: no star selected\n");
+        reportSecondaryStarsAsUnused(multiStarReport);
         errorInfo->starError = Star::STAR_ERROR;
         errorInfo->starMass = 0.0;
         errorInfo->starSNR = 0.0;
@@ -927,6 +973,8 @@ bool GuiderMultiStar::UpdateCurrentPosition(const usImage *pImage, GuiderOffset 
         if (!newStar.Find(pImage, m_searchRegion, pFrame->GetStarFindMode(), GetMinStarHFD(),
             pCamera->GetSaturationADU(), Star::FIND_LOGGING_VERBOSE))
         {
+            multiStarReport->addStar(MultiStarReport::Item::unhealthy(newStar, MultiStarReport::Item::Lost));
+            reportSecondaryStarsAsUnused(multiStarReport);
             errorInfo->starError = newStar.GetError();
             errorInfo->starMass = 0.0;
             errorInfo->starSNR = 0.0;
@@ -951,6 +999,9 @@ bool GuiderMultiStar::UpdateCurrentPosition(const usImage *pImage, GuiderOffset 
             double limits[4];
             if (m_massChecker->CheckMass(newStar.Mass, m_massChangeThreshold, limits))
             {
+                multiStarReport->addStar(MultiStarReport::Item::unhealthy(newStar, MultiStarReport::Item::InvalidMass));
+                reportSecondaryStarsAsUnused(multiStarReport);
+
                 m_primaryStar.SetError(Star::STAR_MASSCHANGE);
                 errorInfo->starError = Star::STAR_MASSCHANGE;
                 errorInfo->starMass = newStar.Mass;
@@ -971,6 +1022,7 @@ bool GuiderMultiStar::UpdateCurrentPosition(const usImage *pImage, GuiderOffset 
             }
         }
 
+
         const PHD_Point& lockPos = LockPosition();
         double distance;
         bool raOnly = MyFrame::GuidingRAOnly();
@@ -988,6 +1040,9 @@ bool GuiderMultiStar::UpdateCurrentPosition(const usImage *pImage, GuiderOffset 
 
         if (!s_distanceChecker.CheckDistance(distance, raOnly, tolerance))
         {
+            multiStarReport->addStar(MultiStarReport::Item::unhealthy(newStar, MultiStarReport::Item::TooFar));
+            reportSecondaryStarsAsUnused(multiStarReport);
+
             m_primaryStar.SetError(Star::STAR_ERROR);
             errorInfo->starError = Star::STAR_ERROR;
             errorInfo->starMass = newStar.Mass;
@@ -1001,6 +1056,7 @@ bool GuiderMultiStar::UpdateCurrentPosition(const usImage *pImage, GuiderOffset 
             throw THROW_INFO("CheckDistance error");
         }
 
+        multiStarReport->addStar(MultiStarReport::Item::healthy(newStar));
         ImageLogger::LogImage(pImage, distance);
 
         // update the star position, mass, etc.
@@ -1012,16 +1068,21 @@ bool GuiderMultiStar::UpdateCurrentPosition(const usImage *pImage, GuiderOffset 
             ofs->cameraOfs = m_primaryStar - lockPos;
             if (m_multiStarMode && m_guideStars.size() > 1)
             {
-                if (RefineOffset(pImage, ofs))
-                    distance = hypot(ofs->cameraOfs.X, ofs->cameraOfs.Y);       // Distance is reported to server clients
+                if (RefineOffset(pImage, ofs, multiStarReport))
+                    distance = hypot(ofs->cameraOfs.X, ofs->cameraOfs.Y); // Distance is reported to server clients
             }
             else
+            {
                 m_starsUsed = 1;
+                reportSecondaryStarsAsUnused(multiStarReport);
+            }
 
             if (pMount && pMount->IsCalibrated())
                 pMount->TransformCameraCoordinatesToMountCoordinates(ofs->cameraOfs, ofs->mountOfs, true);
             double distanceRA = ofs->mountOfs.IsValid() ? fabs(ofs->mountOfs.X) : 0.;
             UpdateCurrentDistance(distance, distanceRA);
+        } else {
+            reportSecondaryStarsAsUnused(multiStarReport);
         }
 
         pFrame->pProfile->UpdateData(pImage, m_primaryStar.X, m_primaryStar.Y);

@@ -47,6 +47,7 @@
 class MassChecker;
 class GuiderMultiStar;
 class GuiderConfigDialogCtrlSet;
+class MultiStarReport;
 
 class GuiderMultiStarConfigDialogCtrlSet : public GuiderConfigDialogCtrlSet
 {
@@ -111,7 +112,7 @@ public:
     bool SetMassChangeThreshold(double starMassChangeThreshold);
     bool SetTolerateJumps(bool enable, double threshold);
     bool SetSearchRegion(int searchRegion);
-    bool RefineOffset(const usImage *pImage, GuiderOffset* pOffset);
+    bool RefineOffset(const usImage *pImage, GuiderOffset *pOffset, MultiStarReport * multiStarReport);
 
     friend class GuiderMultiStarConfigDialogPane;
     friend class GuiderMultiStarConfigDialogCtrlSet;
@@ -143,8 +144,9 @@ public:
 private:
     bool IsValidLockPosition(const PHD_Point& pt) final;
     void InvalidateCurrentPosition(bool fullReset = false) final;
-    bool UpdateCurrentPosition(const usImage *pImage, GuiderOffset *ofs, FrameDroppedInfo *errorInfo) final;
+    bool UpdateCurrentPosition(const usImage *pImage, GuiderOffset *ofs, FrameDroppedInfo *errorInfo, MultiStarReport * multiStarReport) final;
     bool SetCurrentPosition(const usImage *pImage, const PHD_Point& position) final;
+    void reportSecondaryStarsAsUnused(MultiStarReport * multiStarReport) final;
 
     void OnLClick(wxMouseEvent& evt);
 

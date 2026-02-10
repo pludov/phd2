@@ -32,6 +32,7 @@
  *
  */
 #include "phd.h"
+#include "event_server.h"
 #include "nudge_lock.h"
 #include "comet_tool.h"
 #include "polardrift_tool.h"
@@ -1292,8 +1293,8 @@ void Guider::UpdateGuideState(usImage *pImage, bool bStopping)
 
         GuiderOffset ofs;
         FrameDroppedInfo info;
-
-        if (UpdateCurrentPosition(pImage, &ofs, &info))           // true means error
+        DeferedEvent<MultiStarReport> frameStarPositions;
+        if (UpdateCurrentPosition(pImage, &ofs, &info, &frameStarPositions.value)) // true means error
         {
             info.frameNumber = pImage->FrameNum;
             info.time = pFrame->TimeSinceGuidingStarted();
@@ -1511,6 +1512,7 @@ void Guider::UpdateGuideState(usImage *pImage, bool bStopping)
             case STATE_STOP:
                 break;
         }
+        frameStarPositions.send();
     }
     catch (const wxString& Msg)
     {
